@@ -114,9 +114,9 @@ export default function Register() {
           </span>
         </Link>
 
-        <a href="/" className="auth-back-link">
+        <Link to="/" className="auth-back-link">
           Back to Home
-        </a>
+        </Link>
       </header>
 
       <main className="auth-main">

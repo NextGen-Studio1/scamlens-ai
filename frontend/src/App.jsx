@@ -25,6 +25,7 @@ import "./App.css";
 import ReportCybercrime from "./components/ReportCybercrime";
 import Login from './Login';
 import Register from './Register';
+import { useLocation, Link } from "react-router-dom";
 
 const PALETTES = [
   { id: "cyber", name: "Cyber Sentinel", color: "#38bdf8", ring: "#2563eb" },
@@ -119,6 +120,8 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
+  const location = useLocation();
+
   const [user, setUser] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem("scamlens_user")) || null;
@@ -126,6 +129,15 @@ export default function App() {
       return null;
     }
   });
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem("scamlens_user")) || null;
+      setUser(stored);
+    } catch {
+      setUser(null);
+    }
+  }, [location.pathname]);
 
   useEffect(() => {
     localStorage.setItem("scamlens_palette", palette);
@@ -242,13 +254,11 @@ export default function App() {
 
   const riskOrder = ["Low", "Medium", "High", "Unclear"];
 
-  const path = window.location.pathname;
-
-    if (path === '/login') {
+  if (location.pathname === '/login') {
     return <Login />;
   }
 
-  if (path === '/register') {
+  if (location.pathname === '/register') {
     return <Register />;
   }
 
@@ -256,14 +266,14 @@ export default function App() {
     <div className="app-shell" data-theme={palette}>
       <header className="topbar">
         <div className="brand-group">
-          <a href="#" className="brand">
+          <Link to="/" className="brand">
             <span className="brand-mark">
               <ShieldCheck size={22} />
             </span>
             <span className="brand-title">
               ScamLens<span className="accent"> AI</span>
             </span>
-          </a>
+          </Link>
           <span className="header-status">
             <span className="status-dot" /> Threat Detection Engine
           </span>
@@ -311,12 +321,12 @@ export default function App() {
               </>
             ) : (
               <>
-                <a href="/login" className="nav-login-btn">
+                <Link to="/login" className="nav-login-btn">
                   Login
-                </a>
-                <a href="/register" className="nav-register-btn">
+                </Link>
+                <Link to="/register" className="nav-register-btn">
                   Register
-                </a>
+                </Link>
               </>
             )}
           </div>

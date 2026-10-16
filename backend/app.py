@@ -1,6 +1,6 @@
-
 import os
 import re
+import sqlite3
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timezone
@@ -10,9 +10,17 @@ from flask import Flask, jsonify, request
 from google import genai
 from google.genai import types
 from PIL import Image, UnidentifiedImageError
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+    import certifi
+    from pymongo import MongoClient, ASCENDING
+    from pymongo.errors import DuplicateKeyError, PyMongoError
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
+    DuplicateKeyError = Exception
+    PyMongoError = Exception
 
 # --------------------------------------------------
 # ENVIRONMENT CONFIGURATION
@@ -30,27 +38,157 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise RuntimeError("Set GEMINI_API_KEY in backend/.env")
+    # Do not crash the entire app if key is missing during auth tests
+    client = None
+    app.logger.warning("GEMINI_API_KEY is not set in backend/.env")
+else:
+    client = genai.Client(api_key=api_key)
 
-client = genai.Client(api_key=api_key)
 MODEL = "gemma-4-26b-a4b-it"
 
 # --------------------------------------------------
-# MONGODB CONFIGURATION
+# DATABASE ADAPTER (MONGODB ATLAS WITH SQLITE FALLBACK)
 # --------------------------------------------------
 
-MONGO_URI = os.getenv("MONGO_URI")
+SQLITE_DB_PATH = Path(__file__).resolve().parent / "scamlens.db"
 
-if not MONGO_URI:
-    raise RuntimeError("Set MONGO_URI in backend/.env")
+USE_MONGO = False
+mongo_client = None
+users_collection = None
 
-mongo_client = MongoClient(
-    MONGO_URI,
-    serverSelectionTimeoutMS=5000,
-)
 
-db = mongo_client["scamlens"]
-users_collection = db["users"]
+def init_sqlite():
+    """Ensure local SQLite database table exists."""
+    with sqlite3.connect(SQLITE_DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def initialize_database():
+    """Attempt MongoDB Atlas connection; seamlessly fallback to SQLite if needed."""
+    global USE_MONGO, mongo_client, users_collection
+    init_sqlite()
+
+    mongo_uri = os.getenv("MONGO_URI")
+
+    if PYMONGO_AVAILABLE and mongo_uri:
+        try:
+            kwargs = {
+                "serverSelectionTimeoutMS": 4000,
+                "connectTimeoutMS": 4000,
+            }
+            if "certifi" in globals():
+                kwargs["tlsCAFile"] = certifi.where()
+
+            m_client = MongoClient(mongo_uri, **kwargs)
+            m_client.admin.command("ping")
+
+            mongo_client = m_client
+            db = mongo_client["scamlens"]
+            users_collection = db["users"]
+            users_collection.create_index([("email", ASCENDING)], unique=True)
+            USE_MONGO = True
+            print("✓ [DATABASE] Successfully connected to MongoDB Atlas.")
+            return True
+        except Exception as err:
+            USE_MONGO = False
+            print(
+                f"! [DATABASE] MongoDB Atlas unavailable ({err}). "
+                "Active fallback: Using local SQLite database (scamlens.db)."
+            )
+            return False
+    else:
+        USE_MONGO = False
+        print("! [DATABASE] MONGO_URI not configured. Using local SQLite database (scamlens.db).")
+        return False
+
+
+def find_user_by_email(email):
+    """Find a user by normalized email."""
+    email = email.strip().lower()
+
+    if USE_MONGO and users_collection is not None:
+        try:
+            user = users_collection.find_one({"email": email})
+            if user:
+                return {
+                    "id": str(user["_id"]),
+                    "name": user.get("name", ""),
+                    "email": user["email"],
+                    "password_hash": user["password_hash"],
+                }
+        except Exception as err:
+            app.logger.warning("MongoDB read failed: %s; falling back to SQLite", err)
+
+    # SQLite fallback
+    with sqlite3.connect(SQLITE_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name, email, password_hash FROM users WHERE email = ?",
+            (email,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "email": row["email"],
+                "password_hash": row["password_hash"],
+            }
+
+    return None
+
+
+def create_user(name, email, password_hash):
+    """Create a new user; raises ValueError('duplicate') if email exists."""
+    email = email.strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if USE_MONGO and users_collection is not None:
+        try:
+            doc = {
+                "name": name,
+                "email": email,
+                "password_hash": password_hash,
+                "created_at": datetime.now(timezone.utc),
+            }
+            res = users_collection.insert_one(doc)
+            return {
+                "id": str(res.inserted_id),
+                "name": name,
+                "email": email,
+            }
+        except DuplicateKeyError:
+            raise ValueError("duplicate")
+        except Exception as err:
+            app.logger.warning("MongoDB insert failed: %s; falling back to SQLite", err)
+
+    # SQLite fallback
+    try:
+        with sqlite3.connect(SQLITE_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (name, email, password_hash, now_iso),
+            )
+            conn.commit()
+            return {
+                "id": str(cursor.lastrowid),
+                "name": name,
+                "email": email,
+            }
+    except sqlite3.IntegrityError:
+        raise ValueError("duplicate")
+
 
 # --------------------------------------------------
 # AI ANALYSIS PROMPT
@@ -82,20 +220,7 @@ Rules:
 
 
 # --------------------------------------------------
-# DATABASE INITIALIZATION
-# --------------------------------------------------
-
-def initialize_database():
-    """Verify MongoDB connectivity and create the unique email index."""
-    mongo_client.admin.command("ping")
-    users_collection.create_index(
-        [("email", ASCENDING)],
-        unique=True,
-    )
-
-
-# --------------------------------------------------
-# HEALTH CHECK
+# HEALTH & DB TEST
 # --------------------------------------------------
 
 @app.get("/api/health")
@@ -103,26 +228,32 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "ScamLens AI",
+        "database_mode": "mongodb" if USE_MONGO else "sqlite",
     })
 
 
-# --------------------------------------------------
-# DATABASE CONNECTION TEST
-# --------------------------------------------------
-
 @app.get("/api/db-test")
 def test_database():
-    try:
-        mongo_client.admin.command("ping")
-        return jsonify({
-            "message": "MongoDB connected successfully!"
-        }), 200
+    if USE_MONGO and mongo_client is not None:
+        try:
+            mongo_client.admin.command("ping")
+            return jsonify({
+                "status": "ok",
+                "database": "MongoDB Atlas",
+                "message": "MongoDB connected successfully!",
+            }), 200
+        except Exception as err:
+            return jsonify({
+                "status": "fallback",
+                "database": "SQLite",
+                "message": f"MongoDB check failed ({err}), using local SQLite.",
+            }), 200
 
-    except PyMongoError:
-        app.logger.exception("MongoDB connection failed")
-        return jsonify({
-            "error": "Database connection failed. Check server logs."
-        }), 500
+    return jsonify({
+        "status": "ok",
+        "database": "SQLite Local",
+        "message": "Local database active and ready.",
+    }), 200
 
 
 # --------------------------------------------------
@@ -173,32 +304,22 @@ def register():
     if len(password) > 1024:
         return jsonify({"error": "Password is too long."}), 400
 
-    user = {
-        "name": name,
-        "email": email,
-        "password_hash": generate_password_hash(password),
-        "created_at": datetime.now(timezone.utc),
-    }
+    hashed_pw = generate_password_hash(password)
 
     try:
-        result = users_collection.insert_one(user)
-
+        user_info = create_user(name, email, hashed_pw)
         return jsonify({
             "message": "Registration successful.",
-            "user": {
-                "id": str(result.inserted_id),
-                "name": name,
-                "email": email,
-            },
+            "user": user_info,
         }), 201
-
-    except DuplicateKeyError:
-        return jsonify({
-            "error": "An account with this email already exists."
-        }), 409
-
-    except PyMongoError:
-        app.logger.exception("User registration failed")
+    except ValueError as err:
+        if str(err) == "duplicate":
+            return jsonify({
+                "error": "An account with this email already exists."
+            }), 409
+        return jsonify({"error": "Registration failed."}), 400
+    except Exception as err:
+        app.logger.exception("Registration unexpected error: %s", err)
         return jsonify({
             "error": "Could not create your account. Please try again."
         }), 500
@@ -231,11 +352,9 @@ def login():
         }), 400
 
     try:
-        user = users_collection.find_one({"email": email})
+        user = find_user_by_email(email)
 
-        if not user or not check_password_hash(
-            user["password_hash"], password
-        ):
+        if not user or not check_password_hash(user["password_hash"], password):
             return jsonify({
                 "error": "Invalid email or password."
             }), 401
@@ -243,14 +362,14 @@ def login():
         return jsonify({
             "message": "Login successful.",
             "user": {
-                "id": str(user["_id"]),
+                "id": user["id"],
                 "name": user["name"],
                 "email": user["email"],
             },
         }), 200
 
-    except PyMongoError:
-        app.logger.exception("User login failed")
+    except Exception as err:
+        app.logger.exception("Login unexpected error: %s", err)
         return jsonify({
             "error": "Login is temporarily unavailable. Please try again."
         }), 500
@@ -262,6 +381,11 @@ def login():
 
 @app.post("/api/analyze")
 def analyze():
+    if client is None:
+        return jsonify({
+            "error": "AI client is not configured. Set GEMINI_API_KEY in backend/.env."
+        }), 500
+
     message = request.form.get("message", "").strip()
     uploaded = request.files.get("image")
 
@@ -320,21 +444,20 @@ def analyze():
 
         if not response.text:
             return jsonify({
-                "error": "The model returned no analysis. Try again."
+                "error": "The model returned an empty response."
             }), 502
 
-        return jsonify({"analysis": response.text}), 200
+        return jsonify({"analysis": response.text})
 
-    except Exception:
-        app.logger.exception("Gemma API request failed")
+    except Exception as err:
+        app.logger.exception("Analysis error: %s", err)
         return jsonify({
-            "error": "AI request failed. Check model access, API quota, "
-                     "network, and your API key."
+            "error": "AI request failed. Check model access, API quota, network, and your API key."
         }), 502
 
 
 # --------------------------------------------------
-# FILE SIZE ERROR HANDLER
+# ERROR HANDLERS
 # --------------------------------------------------
 
 @app.errorhandler(413)
@@ -349,13 +472,5 @@ def too_large(_error):
 # --------------------------------------------------
 
 if __name__ == "__main__":
-    try:
-        initialize_database()
-        print("MongoDB connected successfully.")
-    except PyMongoError:
-        app.logger.exception(
-            "MongoDB initialization failed. Check Atlas settings and MONGO_URI."
-        )
-        raise SystemExit("Could not connect to MongoDB. Check the error above.")
-
+    initialize_database()
     app.run(debug=True, port=5000)
