@@ -85,30 +85,39 @@ def initialize_database():
                 "serverSelectionTimeoutMS": 4000,
                 "connectTimeoutMS": 4000,
             }
-            if "certifi" in globals():
+            # Only enable TLS CA file for Atlas / TLS connections, not for local plain MongoDB
+            if "certifi" in globals() and (
+                mongo_uri.startswith("mongodb+srv://")
+                or "tls=true" in mongo_uri.lower()
+                or "ssl=true" in mongo_uri.lower()
+            ):
                 kwargs["tlsCAFile"] = certifi.where()
 
             m_client = MongoClient(mongo_uri, **kwargs)
             m_client.admin.command("ping")
 
             mongo_client = m_client
-            db = mongo_client["scamlens"]
+            db = mongo_client.get_database("scamlens")
             users_collection = db["users"]
             users_collection.create_index([("email", ASCENDING)], unique=True)
             USE_MONGO = True
-            print("✓ [DATABASE] Successfully connected to MongoDB Atlas.")
+            print("[DATABASE] Successfully connected to MongoDB.")
             return True
         except Exception as err:
             USE_MONGO = False
             print(
-                f"! [DATABASE] MongoDB Atlas unavailable ({err}). "
+                f"[DATABASE] MongoDB unavailable ({err}). "
                 "Active fallback: Using local SQLite database (scamlens.db)."
             )
             return False
     else:
         USE_MONGO = False
-        print("! [DATABASE] MONGO_URI not configured. Using local SQLite database (scamlens.db).")
+        print("[DATABASE] MONGO_URI not configured. Using local SQLite database (scamlens.db).")
         return False
+
+
+# Initialize database connection on module import / startup
+initialize_database()
 
 
 def find_user_by_email(email):
@@ -472,5 +481,4 @@ def too_large(_error):
 # --------------------------------------------------
 
 if __name__ == "__main__":
-    initialize_database()
-    app.run(debug=True, port=5000)
+    app.run(debug=True, use_reloader=False, port=5000)
